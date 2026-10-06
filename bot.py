@@ -5,12 +5,8 @@ import sqlite3
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message,
-    CallbackQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
 
 # =========================
 # НАСТРОЙКИ
@@ -20,14 +16,15 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 CHANNEL_USERNAME = "@averyy566"
 
-# ПОТОМ ЗАМЕНИШЬ ЭТУ ССЫЛКУ
-REWARD_LINK = "loadstring(game:HttpGet("https://raw.githubusercontent.com/Terfiscript1/KitagawaStealAnEgg/refs/heads/main/KitagawaHubStealAnEgg"))()"
-
-# ТВОЙ TELEGRAM ID
+# Твой Telegram ID
 ADMIN_ID = 8064711596
 
-# Повторная проверка подписки — через 60 секунд
+# Награда, которая будет отправляться пользователю ТЕКСТОМ
+REWARD_SCRIPT = '''loadstring(game:HttpGet("https://raw.githubusercontent.com/Terfiscript1/KitagawaStealAnEgg/refs/heads/main/KitagawaHubStealAnEgg"))()'''
+
+# Между проверками одного пользователя — 60 секунд
 CHECK_COOLDOWN = 60
+
 
 # =========================
 # БОТ
@@ -36,7 +33,9 @@ CHECK_COOLDOWN = 60
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# user_id -> время последней проверки
 last_checks = {}
+
 
 # =========================
 # БАЗА ПОЛЬЗОВАТЕЛЕЙ
@@ -90,19 +89,6 @@ def subscription_keyboard():
     )
 
 
-def reward_keyboard():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🎁 Забрать награду",
-                    url=REWARD_LINK
-                )
-            ]
-        ]
-    )
-
-
 # =========================
 # /START
 # =========================
@@ -130,7 +116,8 @@ async def check_subscription(callback: CallbackQuery):
 
     last_check = last_checks.get(user_id, 0)
 
-    # Если 60 секунд ещё не прошло — просто игнорируем нажатие
+    # Если 60 секунд ещё не прошло —
+    # полностью игнорируем повторное нажатие
     if now - last_check < CHECK_COOLDOWN:
         await callback.answer()
         return
@@ -150,20 +137,26 @@ async def check_subscription(callback: CallbackQuery):
         }
 
         if subscribed:
+
+            # Отправляем ПОЛНЫЙ текст скрипта
             await callback.message.edit_text(
                 "🎉 Подписка подтверждена!\n\n"
-                "Награда готова 👇",
-                reply_markup=reward_keyboard()
+                "Твоя награда:\n\n"
+                f"{REWARD_SCRIPT}"
             )
 
         else:
+
             await callback.message.edit_text(
                 "❌ Подписка не найдена.\n\n"
                 "Попробуйте ещё раз через 60 секунд.",
                 reply_markup=subscription_keyboard()
             )
 
-    except Exception:
+    except Exception as error:
+
+        print(f"Ошибка проверки подписки: {error}")
+
         await callback.message.answer(
             "⚠️ Не удалось проверить подписку.\n"
             "Попробуйте позже."
@@ -179,7 +172,7 @@ async def check_subscription(callback: CallbackQuery):
 @dp.message(F.text.startswith("/broadcast"))
 async def broadcast(message: Message):
 
-    # Проверяем, что команду отправил владелец
+    # Только владелец может делать рассылку
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -204,6 +197,7 @@ async def broadcast(message: Message):
     )
 
     for user_id in users:
+
         try:
             await bot.send_message(
                 chat_id=user_id,
@@ -215,7 +209,13 @@ async def broadcast(message: Message):
             # Небольшая пауза между сообщениями
             await asyncio.sleep(0.05)
 
-        except Exception:
+        except Exception as error:
+
+            print(
+                f"Не удалось отправить сообщение "
+                f"{user_id}: {error}"
+            )
+
             failed += 1
 
     await message.answer(
