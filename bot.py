@@ -4,6 +4,7 @@ import json
 import time
 import os
 import sys
+import threading
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
 if not TOKEN:
@@ -11,10 +12,9 @@ if not TOKEN:
     sys.exit(1)
 
 API = f"https://api.telegram.org/bot{TOKEN}"
-
-# ---- Память диалога (по chat_id) ----
 HISTORY = {}
-MAX_HISTORY = 8  # последние 8 сообщений
+MAX_HISTORY = 8
+HISTORY_LOCK = threading.Lock()
 
 SYSTEM_PROMPT = (
     "Ты полезный ассистент. Отвечай на русском языке, кратко и по делу. "
@@ -33,7 +33,6 @@ def api_call(method, timeout=60, **params):
         return None
 
 def send_message(chat_id, text, parse_mode="HTML"):
-    # Telegram лимит 4096 символов
     for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
         api_call("sendMessage", chat_id=chat_id, text=chunk, parse_mode=parse_mode)
 
@@ -50,33 +49,34 @@ def get_updates(offset=None):
     result = api_call("getUpdates", timeout=40, **params)
     if result and result.get("ok"):
         return result.get("result", [])
+    if result:
+        print(f"[!] getUpdates: {result.get('description')}")
     return []
 
-# ---- LLM через Pollinations (бесплатно, без ключа) ----
 def ask_llm(chat_id, user_text):
-    history = HISTORY.get(chat_id, [])
+    with HISTORY_LOCK:
+        history = HISTORY.get(chat_id, [])
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(history)
     messages.append({"role": "user", "content": user_text})
 
     url = "https://text.pollinations.ai/openai"
-    payload = json.dumps({
-        "model": "openai",
-        "messages": messages
-    }).encode()
+    payload = json.dumps({"model": "openai", "messages": messages}).encode()
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
 
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with urllib.request.urlopen(req, timeout=60) as r:
             data = json.loads(r.read().decode())
             answer = data["choices"][0]["message"]["content"].strip()
     except Exception as e:
+        print(f"[!] LLM error: {e}")
         return f"Не смог ответить: {e}"
 
-    # сохраняем в историю
-    history.append({"role": "user", "content": user_text})
-    history.append({"role": "assistant", "content": answer})
-    HISTORY[chat_id] = history[-MAX_HISTORY:]
+    with HISTORY_LOCK:
+        h = HISTORY.get(chat_id, [])
+        h.append({"role": "user", "content": user_text})
+        h.append({"role": "assistant", "content": answer})
+        HISTORY[chat_id] = h[-MAX_HISTORY:]
 
     return answer
 
@@ -93,12 +93,10 @@ def search_ddg(query):
     try:
         with urllib.request.urlopen(url, timeout=15) as r:
             data = json.loads(r.read().decode())
-        text = data.get("AbstractText") or ""
-        if not text:
-            return None  # ничего не нашёл, вернём None — обработаем LLM'ом
-        return text
+        return data.get("AbstractText") or None
     except Exception as e:
-        return f"Ошибка поиска: {e}"
+        print(f"[!] DDG error: {e}")
+        return None
 
 def handle(update):
     if "message" not in update:
@@ -109,8 +107,11 @@ def handle(update):
     if not text:
         return
 
+    print(f"[>] {chat_id}: {text[:60]}")
+
     if text.startswith("/start"):
-        HISTORY.pop(chat_id, None)
+        with HISTORY_LOCK:
+            HISTORY.pop(chat_id, None)
         send_message(chat_id,
             "Привет! Я твой бот.\n\n"
             "💬 Просто напиши вопрос — отвечу.\n"
@@ -123,7 +124,8 @@ def handle(update):
         return
 
     if text.startswith("/reset"):
-        HISTORY.pop(chat_id, None)
+        with HISTORY_LOCK:
+            HISTORY.pop(chat_id, None)
         send_message(chat_id, "🧹 Память очищена.")
         return
 
@@ -143,7 +145,7 @@ def handle(update):
         if not prompt:
             send_message(chat_id, "Опиши видео: /video a man dancing")
             return
-        send_message(chat_id, "🎬 Генерирую видео. Займёт 1-4 минуты. Не закрывай чат...")
+        send_message(chat_id, "🎬 Генерирую видео. Займёт 1-4 минуты...")
         try:
             result = send_video(chat_id, video_url(prompt))
             if not result or not result.get("ok"):
@@ -158,16 +160,18 @@ def handle(update):
             send_message(chat_id, "Что искать: /search weather Kyiv")
             return
         send_message(chat_id, "🔍 Ищу...")
-        result = search_ddg(query)
-        if result is None:
-            result = ask_llm(chat_id, query)
+        result = search_ddg(query) or ask_llm(chat_id, query)
         send_message(chat_id, result)
         return
 
-    # ---- Обычный текст → LLM ----
+    # обычный текст → LLM
     send_message(chat_id, "💭 Думаю...")
     answer = ask_llm(chat_id, text)
     send_message(chat_id, answer)
+
+def handle_async(update):
+    # каждый апдейт в своём потоке — ничего не блокируется
+    threading.Thread(target=handle, args=(update,), daemon=True).start()
 
 def main():
     print("[+] Bot started")
@@ -177,10 +181,7 @@ def main():
             updates = get_updates(offset)
             for u in updates:
                 offset = u["update_id"] + 1
-                try:
-                    handle(u)
-                except Exception as e:
-                    print(f"[!] handle error: {e}")
+                handle_async(u)   # <-- вот ключевое изменение
         except Exception as e:
             print(f"[!] loop error: {e}")
             time.sleep(3)
