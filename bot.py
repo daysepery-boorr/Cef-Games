@@ -21,12 +21,12 @@ SYSTEM_PROMPT = (
     "На простые вопросы (математика, факты, объяснения) отвечай сразу, без воды."
 )
 
-def api_call(method, timeout=60, **params):
+def api_call(method, _timeout=60, **params):
     url = f"{API}/{method}"
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(url, data=data)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with urllib.request.urlopen(req, timeout=_timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         print(f"[!] {method}: {e}")
@@ -37,16 +37,16 @@ def send_message(chat_id, text, parse_mode="HTML"):
         api_call("sendMessage", chat_id=chat_id, text=chunk, parse_mode=parse_mode)
 
 def send_photo(chat_id, photo_url, caption=""):
-    return api_call("sendPhoto", timeout=120, chat_id=chat_id, photo=photo_url, caption=caption)
+    return api_call("sendPhoto", _timeout=120, chat_id=chat_id, photo=photo_url, caption=caption)
 
 def send_video(chat_id, video_url):
-    return api_call("sendVideo", timeout=300, chat_id=chat_id, video=video_url)
+    return api_call("sendVideo", _timeout=300, chat_id=chat_id, video=video_url)
 
 def get_updates(offset=None):
     params = {"timeout": 30}
     if offset:
         params["offset"] = offset
-    result = api_call("getUpdates", timeout=40, **params)
+    result = api_call("getUpdates", _timeout=40, **params)
     if result and result.get("ok"):
         return result.get("result", [])
     if result:
@@ -164,13 +164,11 @@ def handle(update):
         send_message(chat_id, result)
         return
 
-    # обычный текст → LLM
     send_message(chat_id, "💭 Думаю...")
     answer = ask_llm(chat_id, text)
     send_message(chat_id, answer)
 
 def handle_async(update):
-    # каждый апдейт в своём потоке — ничего не блокируется
     threading.Thread(target=handle, args=(update,), daemon=True).start()
 
 def main():
@@ -181,7 +179,7 @@ def main():
             updates = get_updates(offset)
             for u in updates:
                 offset = u["update_id"] + 1
-                handle_async(u)   # <-- вот ключевое изменение
+                handle_async(u)
         except Exception as e:
             print(f"[!] loop error: {e}")
             time.sleep(3)
