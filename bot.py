@@ -12,6 +12,15 @@ if not TOKEN:
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 
+# ---- Память диалога (по chat_id) ----
+HISTORY = {}
+MAX_HISTORY = 8  # последние 8 сообщений
+
+SYSTEM_PROMPT = (
+    "Ты полезный ассистент. Отвечай на русском языке, кратко и по делу. "
+    "На простые вопросы (математика, факты, объяснения) отвечай сразу, без воды."
+)
+
 def api_call(method, timeout=60, **params):
     url = f"{API}/{method}"
     data = urllib.parse.urlencode(params).encode()
@@ -24,7 +33,9 @@ def api_call(method, timeout=60, **params):
         return None
 
 def send_message(chat_id, text, parse_mode="HTML"):
-    return api_call("sendMessage", chat_id=chat_id, text=text, parse_mode=parse_mode)
+    # Telegram лимит 4096 символов
+    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
+        api_call("sendMessage", chat_id=chat_id, text=chunk, parse_mode=parse_mode)
 
 def send_photo(chat_id, photo_url, caption=""):
     return api_call("sendPhoto", timeout=120, chat_id=chat_id, photo=photo_url, caption=caption)
@@ -41,6 +52,34 @@ def get_updates(offset=None):
         return result.get("result", [])
     return []
 
+# ---- LLM через Pollinations (бесплатно, без ключа) ----
+def ask_llm(chat_id, user_text):
+    history = HISTORY.get(chat_id, [])
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": user_text})
+
+    url = "https://text.pollinations.ai/openai"
+    payload = json.dumps({
+        "model": "openai",
+        "messages": messages
+    }).encode()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            data = json.loads(r.read().decode())
+            answer = data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"Не смог ответить: {e}"
+
+    # сохраняем в историю
+    history.append({"role": "user", "content": user_text})
+    history.append({"role": "assistant", "content": answer})
+    HISTORY[chat_id] = history[-MAX_HISTORY:]
+
+    return answer
+
 def image_url(prompt):
     q = urllib.parse.quote(prompt)
     return f"https://image.pollinations.ai/prompt/{q}?width=1024&height=1024&model=flux&nologo=true"
@@ -56,7 +95,7 @@ def search_ddg(query):
             data = json.loads(r.read().decode())
         text = data.get("AbstractText") or ""
         if not text:
-            return "Ничего не нашёл. Попробуй переформулировать."
+            return None  # ничего не нашёл, вернём None — обработаем LLM'ом
         return text
     except Exception as e:
         return f"Ошибка поиска: {e}"
@@ -71,16 +110,24 @@ def handle(update):
         return
 
     if text.startswith("/start"):
+        HISTORY.pop(chat_id, None)
         send_message(chat_id,
             "Привет! Я твой бот.\n\n"
+            "💬 Просто напиши вопрос — отвечу.\n"
             "🔍 /search &lt;запрос&gt; — поиск в интернете\n"
-            "🎨 /image &lt;описание&gt; — картинка\n"
-            "🎬 /video &lt;описание&gt; — видео (1-4 мин)\n\n"
-            "Или просто напиши вопрос.\n\n"
-            "<b>Совет:</b> промпты лучше писать на английском."
+            "🎨 /image &lt;описание&gt; — картинка (англ. лучше)\n"
+            "🎬 /video &lt;описание&gt; — видео (1-4 мин)\n"
+            "🧹 /reset — очистить память диалога\n\n"
+            "Например: <i>сколько будет 2 умножить на 2?</i>"
         )
+        return
 
-    elif text.startswith("/image"):
+    if text.startswith("/reset"):
+        HISTORY.pop(chat_id, None)
+        send_message(chat_id, "🧹 Память очищена.")
+        return
+
+    if text.startswith("/image"):
         prompt = text.replace("/image", "", 1).strip()
         if not prompt:
             send_message(chat_id, "Напиши описание: /image cat in space")
@@ -88,32 +135,39 @@ def handle(update):
         send_message(chat_id, "🎨 Генерирую...")
         result = send_photo(chat_id, image_url(prompt))
         if not result or not result.get("ok"):
-            send_message(chat_id, "❌ Не удалось сгенерировать. Попробуй ещё раз.")
+            send_message(chat_id, "❌ Не получилось. Попробуй ещё раз.")
+        return
 
-    elif text.startswith("/video"):
+    if text.startswith("/video"):
         prompt = text.replace("/video", "", 1).strip()
         if not prompt:
             send_message(chat_id, "Опиши видео: /video a man dancing")
             return
-        send_message(chat_id, "🎬 Генерирую видео. Это займёт 1-4 минуты. Не закрывай чат...")
+        send_message(chat_id, "🎬 Генерирую видео. Займёт 1-4 минуты. Не закрывай чат...")
         try:
             result = send_video(chat_id, video_url(prompt))
             if not result or not result.get("ok"):
-                send_message(chat_id, "❌ Не удалось отправить видео. Сервер перегружен, попробуй через минуту.")
+                send_message(chat_id, "❌ Сервер перегружен, попробуй через минуту.")
         except Exception as e:
             send_message(chat_id, f"❌ Ошибка: {e}")
+        return
 
-    elif text.startswith("/search"):
+    if text.startswith("/search"):
         query = text.replace("/search", "", 1).strip()
         if not query:
             send_message(chat_id, "Что искать: /search weather Kyiv")
             return
         send_message(chat_id, "🔍 Ищу...")
-        send_message(chat_id, search_ddg(query))
+        result = search_ddg(query)
+        if result is None:
+            result = ask_llm(chat_id, query)
+        send_message(chat_id, result)
+        return
 
-    else:
-        send_message(chat_id, "🤔 Ищу...")
-        send_message(chat_id, search_ddg(text))
+    # ---- Обычный текст → LLM ----
+    send_message(chat_id, "💭 Думаю...")
+    answer = ask_llm(chat_id, text)
+    send_message(chat_id, answer)
 
 def main():
     print("[+] Bot started")
