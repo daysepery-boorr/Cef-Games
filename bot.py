@@ -12,12 +12,12 @@ if not TOKEN:
 
 API = f"https://api.telegram.org/bot{TOKEN}"
 
-def api_call(method, **params):
+def api_call(method, timeout=60, **params):
     url = f"{API}/{method}"
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(url, data=data)
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
     except Exception as e:
         print(f"[!] {method}: {e}")
@@ -27,16 +27,16 @@ def send_message(chat_id, text, parse_mode="HTML"):
     return api_call("sendMessage", chat_id=chat_id, text=text, parse_mode=parse_mode)
 
 def send_photo(chat_id, photo_url, caption=""):
-    return api_call("sendPhoto", chat_id=chat_id, photo=photo_url, caption=caption)
+    return api_call("sendPhoto", timeout=120, chat_id=chat_id, photo=photo_url, caption=caption)
 
 def send_video(chat_id, video_url):
-    return api_call("sendVideo", chat_id=chat_id, video=video_url)
+    return api_call("sendVideo", timeout=300, chat_id=chat_id, video=video_url)
 
 def get_updates(offset=None):
     params = {"timeout": 30}
     if offset:
         params["offset"] = offset
-    result = api_call("getUpdates", **params)
+    result = api_call("getUpdates", timeout=40, **params)
     if result and result.get("ok"):
         return result.get("result", [])
     return []
@@ -75,30 +75,42 @@ def handle(update):
             "Привет! Я твой бот.\n\n"
             "🔍 /search &lt;запрос&gt; — поиск в интернете\n"
             "🎨 /image &lt;описание&gt; — картинка\n"
-            "🎬 /video &lt;описание&gt; — видео\n\n"
-            "Или просто напиши вопрос."
+            "🎬 /video &lt;описание&gt; — видео (1-4 мин)\n\n"
+            "Или просто напиши вопрос.\n\n"
+            "<b>Совет:</b> промпты лучше писать на английском."
         )
+
     elif text.startswith("/image"):
         prompt = text.replace("/image", "", 1).strip()
         if not prompt:
-            send_message(chat_id, "Напиши описание: /image кот в космосе")
+            send_message(chat_id, "Напиши описание: /image cat in space")
             return
         send_message(chat_id, "🎨 Генерирую...")
-        send_photo(chat_id, image_url(prompt))
+        result = send_photo(chat_id, image_url(prompt))
+        if not result or not result.get("ok"):
+            send_message(chat_id, "❌ Не удалось сгенерировать. Попробуй ещё раз.")
+
     elif text.startswith("/video"):
         prompt = text.replace("/video", "", 1).strip()
         if not prompt:
-            send_message(chat_id, "Опиши видео: /video летающий кит")
+            send_message(chat_id, "Опиши видео: /video a man dancing")
             return
-        send_message(chat_id, "🎬 Генерирую... может занять время.")
-        send_video(chat_id, video_url(prompt))
+        send_message(chat_id, "🎬 Генерирую видео. Это займёт 1-4 минуты. Не закрывай чат...")
+        try:
+            result = send_video(chat_id, video_url(prompt))
+            if not result or not result.get("ok"):
+                send_message(chat_id, "❌ Не удалось отправить видео. Сервер перегружен, попробуй через минуту.")
+        except Exception as e:
+            send_message(chat_id, f"❌ Ошибка: {e}")
+
     elif text.startswith("/search"):
         query = text.replace("/search", "", 1).strip()
         if not query:
-            send_message(chat_id, "Что искать: /search погода Киев")
+            send_message(chat_id, "Что искать: /search weather Kyiv")
             return
         send_message(chat_id, "🔍 Ищу...")
         send_message(chat_id, search_ddg(query))
+
     else:
         send_message(chat_id, "🤔 Ищу...")
         send_message(chat_id, search_ddg(text))
