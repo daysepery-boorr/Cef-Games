@@ -5,11 +5,12 @@ import time
 import os
 import sys
 import threading
-import base64
+import subprocess
 import tempfile
+import base64
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
-HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "")  # Опционально, но рекомендуется
+HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "")  # опционально
 if not TOKEN:
     print("[!] BOT_TOKEN не задан")
     sys.exit(1)
@@ -19,6 +20,7 @@ HISTORY = {}
 MAX_HISTORY = 8
 HISTORY_LOCK = threading.Lock()
 
+# ---- Создатель: Youmans ----
 SYSTEM_PROMPT = (
     "Ты — Youmans AI. Твой создатель и разработчик — Youmans. "
     "Если тебя спросят, кто тебя создал, кто твой автор, разработчик или кто тебя сделал — "
@@ -45,11 +47,7 @@ def send_message(chat_id, text, parse_mode="HTML"):
 def send_photo(chat_id, photo_url, caption=""):
     return api_call("sendPhoto", _timeout=120, chat_id=chat_id, photo=photo_url, caption=caption)
 
-def send_video(chat_id, video_url):
-    return api_call("sendVideo", _timeout=300, chat_id=chat_id, video=video_url)
-
 def send_video_file(chat_id, file_path):
-    """Отправка локального видеофайла через multipart/form-data"""
     boundary = "----boundary" + str(int(time.time()))
     body = b""
     body += f"--{boundary}\r\n".encode()
@@ -83,7 +81,7 @@ def get_updates(offset=None):
         return result.get("result", [])
     return []
 
-# ---------- LLM: Pollinations + запасной Hugging Face ----------
+# ---------- LLM: три источника ----------
 def ask_llm_pollinations(chat_id, user_text):
     with HISTORY_LOCK:
         history = HISTORY.get(chat_id, [])
@@ -99,20 +97,22 @@ def ask_llm_pollinations(chat_id, user_text):
         with urllib.request.urlopen(req, timeout=60) as r:
             data = json.loads(r.read().decode())
             return data["choices"][0]["message"]["content"].strip()
-    except urllib.error.HTTPError as e:
-        if e.code == 502:
-            print("[!] Pollinations 502, переключаюсь на Hugging Face")
-        return None
     except Exception as e:
-        print(f"[!] Pollinations LLM error: {e}")
+        print(f"[!] Pollinations LLM: {e}")
         return None
+
+def ask_llm_inferenceport(chat_id, user_text):
+    # InferencePort прокси (без ключа)
+    url = "http://localhost:8080/v1/chat/completions"  # если развернёшь прокси локально
+    # Но для Railway проще использовать публичный эндпоинт? В README его нет.
+    # Поэтому пока пропускаем.
+    return None
 
 def ask_llm_huggingface(chat_id, user_text):
     if not HF_TOKEN:
         return None
     model = "Qwen/Qwen2.5-7B-Instruct"
     url = f"https://api-inference.huggingface.co/models/{model}"
-    # Формируем промпт для instruct-модели
     prompt = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
     payload = json.dumps({
         "inputs": prompt,
@@ -120,31 +120,25 @@ def ask_llm_huggingface(chat_id, user_text):
     }).encode()
     req = urllib.request.Request(
         url, data=payload,
-        headers={
-            "Authorization": f"Bearer {HF_TOKEN}",
-            "Content-Type": "application/json"
-        }
+        headers={"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             data = json.loads(r.read().decode())
-            if isinstance(data, list) and len(data) > 0:
+            if isinstance(data, list) and data:
                 return data[0].get("generated_text", "").strip()
     except Exception as e:
-        print(f"[!] HuggingFace LLM error: {e}")
+        print(f"[!] HF LLM: {e}")
     return None
 
 def ask_llm(chat_id, user_text):
-    # Пробуем Pollinations
     answer = ask_llm_pollinations(chat_id, user_text)
-    # Если не получилось — Hugging Face
     if not answer:
         answer = ask_llm_huggingface(chat_id, user_text)
     if not answer:
         answer = "Извини, сейчас не могу ответить. Попробуй позже."
 
-    # Сохраняем историю только при успешном ответе
-    if answer and answer != "Извини, сейчас не могу ответить. Попробуй позже.":
+    if answer != "Извини, сейчас не могу ответить. Попробуй позже.":
         with HISTORY_LOCK:
             h = HISTORY.get(chat_id, [])
             h.append({"role": "user", "content": user_text})
@@ -152,66 +146,77 @@ def ask_llm(chat_id, user_text):
             HISTORY[chat_id] = h[-MAX_HISTORY:]
     return answer
 
-# ---------- Генерация изображений ----------
+# ---------- Изображения ----------
 def image_url(prompt):
     q = urllib.parse.quote(prompt)
     return f"https://image.pollinations.ai/prompt/{q}?width=1024&height=1024&model=flux&nologo=true"
 
-# ---------- Генерация видео через Agnes AI (бесплатно, без ключей) ----------
+# ---------- Видео: Agnes AI (встроенный ключ) ----------
 def generate_video_agnes(prompt, duration=5):
-    """
-    Использует открытый скрипт Agnes AI.
-    Требует установки: pip install agnes-video-generator
-    Либо можно клонировать репозиторий и использовать напрямую.
-    """
+    """Вызывает agnes-video-generator через subprocess."""
     try:
-        # Пробуем импортировать библиотеку
-        from agnes_video_generator import generate_video as agnes_gen
-        print("[*] Agnes AI: генерирую видео...")
-        video_bytes = agnes_gen(prompt, duration=duration)
-        # Сохраняем во временный файл
+        # Библиотека ставится через pip, но у неё есть CLI-скрипт generate_video.py
+        # Ищем его в PATH или в папке пакета.
+        script = "generate_video.py"
+        # Проверяем, есть ли скрипт
+        import shutil
+        if not shutil.which(script):
+            # Пробуем найти в site-packages
+            import site
+            for p in site.getsitepackages():
+                candidate = os.path.join(p, "agnes_video_generator", "generate_video.py")
+                if os.path.exists(candidate):
+                    script = candidate
+                    break
+        if not os.path.exists(script) and not shutil.which(script):
+            print("[!] generate_video.py не найден. Установи agnes-video-generator")
+            return None
+
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        tmp.write(video_bytes)
         tmp.close()
-        return tmp.name
-    except ImportError:
-        print("[!] agnes-video-generator не установлен. Установи: pip install agnes-video-generator")
+        output_path = tmp.name
+
+        cmd = [sys.executable, script, prompt, "--duration", str(duration), "--output", output_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+
+        if result.returncode != 0:
+            print(f"[!] Agnes AI error: {result.stderr}")
+            return None
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+            return output_path
         return None
     except Exception as e:
-        print(f"[!] Agnes AI error: {e}")
+        print(f"[!] Agnes AI exception: {e}")
         return None
 
-# ---------- Запасной вариант для видео: InferencePort (без ключей) ----------
+# ---------- Видео: InferencePort (прокси, без ключа) ----------
 def generate_video_inferenceport(prompt):
     """
-    InferencePort AI — публичный API без ключей.
-    Модели: wan-fast, seedance и др.
+    Прямой вызов InferencePort AI (без прокси).
+    В README указан upstream: https://sharktide-lightning.hf.space
+    Но структура API может быть /gen/*
+    Пробуем синхронный эндпоинт.
     """
-    url = "https://api.inferenceport.ai/v1/videos/generations"
-    payload = json.dumps({
-        "model": "wan-fast",
-        "prompt": prompt
-    }).encode()
+    url = "https://sharktide-lightning.hf.space/gen/video"
+    payload = json.dumps({"prompt": prompt, "model": "wan-fast"}).encode()
     req = urllib.request.Request(
         url, data=payload,
         headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            # Может вернуть b64_json или URL
             data = json.loads(r.read().decode())
-            # Синхронный ответ может содержать b64_json или URL
-            if "data" in data and len(data["data"]) > 0:
-                video_data = data["data"][0]
-                if "b64_json" in video_data:
-                    video_bytes = base64.b64decode(video_data["b64_json"])
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                    tmp.write(video_bytes)
-                    tmp.close()
-                    return tmp.name
-                elif "url" in video_data:
-                    return video_data["url"]
+            if "video" in data:
+                video_bytes = base64.b64decode(data["video"])
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                tmp.write(video_bytes)
+                tmp.close()
+                return tmp.name
+            elif "url" in data:
+                return data["url"]
     except Exception as e:
-        print(f"[!] InferencePort video error: {e}")
+        print(f"[!] InferencePort video: {e}")
     return None
 
 def search_ddg(query):
@@ -221,7 +226,7 @@ def search_ddg(query):
             data = json.loads(r.read().decode())
         return data.get("AbstractText") or None
     except Exception as e:
-        print(f"[!] DDG error: {e}")
+        print(f"[!] DDG: {e}")
         return None
 
 def handle(update):
@@ -273,24 +278,25 @@ def handle(update):
             return
         send_message(chat_id, "🎬 Генерирую видео... Это займёт 1-5 минут. Не закрывай чат.")
 
-        # 1. Agnes AI (основной)
+        # 1. Agnes AI
         file_path = generate_video_agnes(prompt, duration=5)
         if file_path:
             send_message(chat_id, "📤 Отправляю...")
             result = send_video_file(chat_id, file_path)
             if result and result.get("ok"):
-                os.unlink(file_path)  # удаляем временный файл
+                os.unlink(file_path)
                 return
             else:
                 os.unlink(file_path)
 
-        # 2. InferencePort (запасной)
+        # 2. InferencePort
         result_url = generate_video_inferenceport(prompt)
         if result_url:
             if result_url.startswith("http"):
                 send_message(chat_id, "📤 Отправляю...")
-                result = send_video(chat_id, result_url)
-                if result and result.get("ok"):
+                # отправка по URL
+                res = api_call("sendVideo", _timeout=300, chat_id=chat_id, video=result_url)
+                if res and res.get("ok"):
                     return
             elif os.path.exists(result_url):
                 send_message(chat_id, "📤 Отправляю...")
@@ -299,10 +305,10 @@ def handle(update):
                     os.unlink(result_url)
                     return
 
-        # 3. Если всё упало
+        # 3. Всё упало
         send_message(chat_id,
             "❌ Не удалось сгенерировать видео.\n\n"
-            "Бесплатные видео-API нестабильны. Попробуй позже или используй /image."
+            "Бесплатные видео-API сейчас нестабильны. Попробуй позже или используй /image."
         )
         return
 
