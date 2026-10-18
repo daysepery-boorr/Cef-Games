@@ -5,9 +5,11 @@ import time
 import os
 import sys
 import threading
+import base64
+import tempfile
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
-HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "")  # опционально
+HF_TOKEN = os.environ.get("HUGGINGFACE_TOKEN", "")  # Опционально, но рекомендуется
 if not TOKEN:
     print("[!] BOT_TOKEN не задан")
     sys.exit(1)
@@ -17,15 +19,12 @@ HISTORY = {}
 MAX_HISTORY = 8
 HISTORY_LOCK = threading.Lock()
 
-# ---- Создатель: Youmans ----
 SYSTEM_PROMPT = (
-    "Ты полезный ассистент по имени Youmans AI. "
-    "Твой создатель и разработчик — Youmans. "
-    "Если тебя спросят, кто тебя создал, кто твой автор, разработчик "
-    "или кто тебя сделал — отвечай, что тебя создал Youmans. "
-    "Не упоминай OpenAI, Anthropic, Google, Pollinations или другие компании "
-    "как своих создателей. Ты — проект Youmans. "
-    "Отвечай на русском языке, кратко и по делу."
+    "Ты — Youmans AI. Твой создатель и разработчик — Youmans. "
+    "Если тебя спросят, кто тебя создал, кто твой автор, разработчик или кто тебя сделал — "
+    "отвечай только: 'Меня создал Youmans'. "
+    "Не упоминай OpenAI, Anthropic, Google, Pollinations, Hugging Face или другие компании как своих создателей. "
+    "Ты — проект Youmans. Отвечай на русском языке, кратко и по делу."
 )
 
 def api_call(method, _timeout=60, **params):
@@ -49,8 +48,31 @@ def send_photo(chat_id, photo_url, caption=""):
 def send_video(chat_id, video_url):
     return api_call("sendVideo", _timeout=300, chat_id=chat_id, video=video_url)
 
-def send_document(chat_id, doc_url, caption=""):
-    return api_call("sendDocument", _timeout=300, chat_id=chat_id, document=doc_url, caption=caption)
+def send_video_file(chat_id, file_path):
+    """Отправка локального видеофайла через multipart/form-data"""
+    boundary = "----boundary" + str(int(time.time()))
+    body = b""
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
+    body += str(chat_id).encode() + b"\r\n"
+    body += f"--{boundary}\r\n".encode()
+    body += b'Content-Disposition: form-data; name="video"; filename="video.mp4"\r\n'
+    body += b"Content-Type: video/mp4\r\n\r\n"
+    with open(file_path, "rb") as f:
+        body += f.read() + b"\r\n"
+    body += f"--{boundary}--\r\n".encode()
+
+    req = urllib.request.Request(
+        f"{API}/sendVideo",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.loads(r.read().decode())
+    except Exception as e:
+        print(f"[!] send_video_file: {e}")
+        return None
 
 def get_updates(offset=None):
     params = {"timeout": 30}
@@ -59,11 +81,10 @@ def get_updates(offset=None):
     result = api_call("getUpdates", _timeout=40, **params)
     if result and result.get("ok"):
         return result.get("result", [])
-    if result:
-        print(f"[!] getUpdates: {result.get('description')}")
     return []
 
-def ask_llm(chat_id, user_text):
+# ---------- LLM: Pollinations + запасной Hugging Face ----------
+def ask_llm_pollinations(chat_id, user_text):
     with HISTORY_LOCK:
         history = HISTORY.get(chat_id, [])
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -77,68 +98,121 @@ def ask_llm(chat_id, user_text):
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             data = json.loads(r.read().decode())
-            answer = data["choices"][0]["message"]["content"].strip()
+            return data["choices"][0]["message"]["content"].strip()
+    except urllib.error.HTTPError as e:
+        if e.code == 502:
+            print("[!] Pollinations 502, переключаюсь на Hugging Face")
+        return None
     except Exception as e:
-        print(f"[!] LLM error: {e}")
-        return f"Не смог ответить: {e}"
+        print(f"[!] Pollinations LLM error: {e}")
+        return None
 
-    with HISTORY_LOCK:
-        h = HISTORY.get(chat_id, [])
-        h.append({"role": "user", "content": user_text})
-        h.append({"role": "assistant", "content": answer})
-        HISTORY[chat_id] = h[-MAX_HISTORY:]
+def ask_llm_huggingface(chat_id, user_text):
+    if not HF_TOKEN:
+        return None
+    model = "Qwen/Qwen2.5-7B-Instruct"
+    url = f"https://api-inference.huggingface.co/models/{model}"
+    # Формируем промпт для instruct-модели
+    prompt = f"<|im_start|>system\n{SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
+    payload = json.dumps({
+        "inputs": prompt,
+        "parameters": {"max_new_tokens": 500, "return_full_text": False}
+    }).encode()
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Content-Type": "application/json"
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read().decode())
+            if isinstance(data, list) and len(data) > 0:
+                return data[0].get("generated_text", "").strip()
+    except Exception as e:
+        print(f"[!] HuggingFace LLM error: {e}")
+    return None
 
+def ask_llm(chat_id, user_text):
+    # Пробуем Pollinations
+    answer = ask_llm_pollinations(chat_id, user_text)
+    # Если не получилось — Hugging Face
+    if not answer:
+        answer = ask_llm_huggingface(chat_id, user_text)
+    if not answer:
+        answer = "Извини, сейчас не могу ответить. Попробуй позже."
+
+    # Сохраняем историю только при успешном ответе
+    if answer and answer != "Извини, сейчас не могу ответить. Попробуй позже.":
+        with HISTORY_LOCK:
+            h = HISTORY.get(chat_id, [])
+            h.append({"role": "user", "content": user_text})
+            h.append({"role": "assistant", "content": answer})
+            HISTORY[chat_id] = h[-MAX_HISTORY:]
     return answer
 
+# ---------- Генерация изображений ----------
 def image_url(prompt):
     q = urllib.parse.quote(prompt)
     return f"https://image.pollinations.ai/prompt/{q}?width=1024&height=1024&model=flux&nologo=true"
 
-# ---- Генерация видео: три попытки, потом честный отказ ----
-def try_video_pollinations(prompt):
-    q = urllib.parse.quote(prompt)
-    urls = [
-        f"https://video.pollinations.ai/prompt/{q}?model=seedance",
-        f"https://video.pollinations.ai/prompt/{q}",
-        f"https://gen.pollinations.ai/video/{q}?model=seedance",
-    ]
-    for u in urls:
-        try:
-            req = urllib.request.Request(u, method="HEAD")
-            with urllib.request.urlopen(req, timeout=20) as r:
-                if r.status == 200:
-                    return u
-        except Exception as e:
-            print(f"[!] video try {u[:60]}: {e}")
-    return None
-
-def try_video_huggingface(prompt):
-    if not HF_TOKEN:
+# ---------- Генерация видео через Agnes AI (бесплатно, без ключей) ----------
+def generate_video_agnes(prompt, duration=5):
+    """
+    Использует открытый скрипт Agnes AI.
+    Требует установки: pip install agnes-video-generator
+    Либо можно клонировать репозиторий и использовать напрямую.
+    """
+    try:
+        # Пробуем импортировать библиотеку
+        from agnes_video_generator import generate_video as agnes_gen
+        print("[*] Agnes AI: генерирую видео...")
+        video_bytes = agnes_gen(prompt, duration=duration)
+        # Сохраняем во временный файл
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tmp.write(video_bytes)
+        tmp.close()
+        return tmp.name
+    except ImportError:
+        print("[!] agnes-video-generator не установлен. Установи: pip install agnes-video-generator")
         return None
-    # модель text-to-video от damo-vilab — бесплатный tier
-    model = "damo-vilab/text-to-video-ms-1.7b"
-    url = f"https://api-inference.huggingface.co/models/{model}"
-    payload = json.dumps({"inputs": prompt}).encode()
+    except Exception as e:
+        print(f"[!] Agnes AI error: {e}")
+        return None
+
+# ---------- Запасной вариант для видео: InferencePort (без ключей) ----------
+def generate_video_inferenceport(prompt):
+    """
+    InferencePort AI — публичный API без ключей.
+    Модели: wan-fast, seedance и др.
+    """
+    url = "https://api.inferenceport.ai/v1/videos/generations"
+    payload = json.dumps({
+        "model": "wan-fast",
+        "prompt": prompt
+    }).encode()
     req = urllib.request.Request(
-        url, data=payload, method="POST",
-        headers={
-            "Authorization": f"Bearer {HF_TOKEN}",
-            "Content-Type": "application/json",
-        }
+        url, data=payload,
+        headers={"Content-Type": "application/json"}
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as r:
-            video_bytes = r.read()
-            if len(video_bytes) < 1000:
-                return None
-            # сохраняем локально
-            path = f"/tmp/video_{int(time.time())}.mp4"
-            with open(path, "wb") as f:
-                f.write(video_bytes)
-            return path
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data = json.loads(r.read().decode())
+            # Синхронный ответ может содержать b64_json или URL
+            if "data" in data and len(data["data"]) > 0:
+                video_data = data["data"][0]
+                if "b64_json" in video_data:
+                    video_bytes = base64.b64decode(video_data["b64_json"])
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    tmp.write(video_bytes)
+                    tmp.close()
+                    return tmp.name
+                elif "url" in video_data:
+                    return video_data["url"]
     except Exception as e:
-        print(f"[!] HF video: {e}")
-        return None
+        print(f"[!] InferencePort video error: {e}")
+    return None
 
 def search_ddg(query):
     url = f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_html=1"
@@ -166,12 +240,12 @@ def handle(update):
             HISTORY.pop(chat_id, None)
         send_message(chat_id,
             "Привет! Я <b>Youmans AI</b> — бот, созданный Youmans.\n\n"
-            "💬 Просто напиши вопрос — отвечу.\n"
-            "🔍 /search &lt;запрос&gt; — поиск в интернете\n"
-            "🎨 /image &lt;описание&gt; — картинка (англ. лучше)\n"
-            "🎬 /video &lt;описание&gt; — видео (нестабильно, 1-4 мин)\n"
-            "🧹 /reset — очистить память диалога\n\n"
-            "Например: <i>сколько будет 2 умножить на 2?</i>"
+            "💬 Напиши вопрос — отвечу.\n"
+            "🔍 /search — поиск в интернете\n"
+            "🎨 /image — картинка\n"
+            "🎬 /video — видео (5-10 сек, 1-5 мин ожидания)\n"
+            "🧹 /reset — очистить память\n\n"
+            "Например: <i>кто тебя создал?</i>"
         )
         return
 
@@ -197,52 +271,38 @@ def handle(update):
         if not prompt:
             send_message(chat_id, "Опиши видео: /video a man dancing")
             return
-        send_message(chat_id, "🎬 Ищу рабочую модель видео... Займёт время.")
+        send_message(chat_id, "🎬 Генерирую видео... Это займёт 1-5 минут. Не закрывай чат.")
 
-        # 1. пробуем HuggingFace (если токен есть)
-        hf_path = try_video_huggingface(prompt)
-        if hf_path:
+        # 1. Agnes AI (основной)
+        file_path = generate_video_agnes(prompt, duration=5)
+        if file_path:
             send_message(chat_id, "📤 Отправляю...")
-            try:
-                files = {"video": open(hf_path, "rb")}
-                # отправка файла через requests-like нельзя — делаем multipart вручную
-                boundary = "----boundary" + str(int(time.time()))
-                body = b""
-                body += f"--{boundary}\r\n".encode()
-                body += b'Content-Disposition: form-data; name="chat_id"\r\n\r\n'
-                body += str(chat_id).encode() + b"\r\n"
-                body += f"--{boundary}\r\n".encode()
-                body += b'Content-Disposition: form-data; name="video"; filename="video.mp4"\r\n'
-                body += b"Content-Type: video/mp4\r\n\r\n"
-                body += open(hf_path, "rb").read() + b"\r\n"
-                body += f"--{boundary}--\r\n".encode()
-
-                req = urllib.request.Request(
-                    f"{API}/sendVideo",
-                    data=body,
-                    headers={"Content-Type": f"multipart/form-data; boundary={boundary}"}
-                )
-                with urllib.request.urlopen(req, timeout=300) as r:
-                    print(f"[+] video sent: {r.status}")
-                os.remove(hf_path)
-                return
-            except Exception as e:
-                print(f"[!] send hf video: {e}")
-
-        # 2. пробуем Pollinations
-        url = try_video_pollinations(prompt)
-        if url:
-            send_message(chat_id, "📤 Отправляю...")
-            result = send_video(chat_id, url)
+            result = send_video_file(chat_id, file_path)
             if result and result.get("ok"):
+                os.unlink(file_path)  # удаляем временный файл
                 return
-            print(f"[!] pollinations send failed: {result}")
+            else:
+                os.unlink(file_path)
 
-        # 3. всё упало — честно
+        # 2. InferencePort (запасной)
+        result_url = generate_video_inferenceport(prompt)
+        if result_url:
+            if result_url.startswith("http"):
+                send_message(chat_id, "📤 Отправляю...")
+                result = send_video(chat_id, result_url)
+                if result and result.get("ok"):
+                    return
+            elif os.path.exists(result_url):
+                send_message(chat_id, "📤 Отправляю...")
+                result = send_video_file(chat_id, result_url)
+                if result and result.get("ok"):
+                    os.unlink(result_url)
+                    return
+
+        # 3. Если всё упало
         send_message(chat_id,
-            "❌ Видео сейчас не работает.\n\n"
-            "Бесплатные видео-API нестабильны — сервис либо перегружен, либо лёг.\n\n"
-            "Попробуй позже или используй /image (картинки работают стабильно)."
+            "❌ Не удалось сгенерировать видео.\n\n"
+            "Бесплатные видео-API нестабильны. Попробуй позже или используй /image."
         )
         return
 
